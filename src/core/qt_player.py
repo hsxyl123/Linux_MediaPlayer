@@ -2,12 +2,18 @@
 Qt Multimedia Player Backend Implementation
 """
 
-from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
-from PyQt5.QtMultimediaWidgets import QVideoWidget
-from PyQt5.QtCore import QUrl
-from .player_base import PlayerBackend, PlayerState
+import sys
+import subprocess
 
-QT_AVAILABLE = True
+try:
+    from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+    from PyQt5.QtMultimediaWidgets import QVideoWidget
+    from PyQt5.QtCore import QUrl
+    QT_AVAILABLE = True
+except ImportError:
+    QT_AVAILABLE = False
+
+from .player_base import PlayerBackend, PlayerState
 
 
 class QtPlayer(PlayerBackend):
@@ -28,7 +34,26 @@ class QtPlayer(PlayerBackend):
     
     @staticmethod
     def is_available() -> bool:
-        return QT_AVAILABLE
+        if not QT_AVAILABLE:
+            return False
+        if sys.platform == 'linux':
+            try:
+                result = subprocess.run(
+                    ['gst-inspect-1.0', 'playback'],
+                    capture_output=True, text=True, timeout=3
+                )
+                if result.returncode != 0:
+                    print("Warning: GStreamer playback plugin not found.")
+                    print("  Install with: sudo apt install gstreamer1.0-plugins-base")
+                    return False
+            except FileNotFoundError:
+                print("Warning: gst-inspect-1.0 not found, GStreamer may not be installed.")
+                print("  Install with: sudo apt install gstreamer1.0-plugins-base gstreamer1.0-plugins-good")
+                print("                gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-libav")
+                return False
+            except subprocess.TimeoutExpired:
+                return False
+        return True
     
     @staticmethod
     def get_backend_name() -> str:
