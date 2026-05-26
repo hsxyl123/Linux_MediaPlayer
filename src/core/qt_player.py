@@ -94,6 +94,7 @@ class QtPlayer(PlayerBackend):
             QMediaPlayer.StoppedState: PlayerState.STOPPED,
             QMediaPlayer.PlayingState: PlayerState.PLAYING,
             QMediaPlayer.PausedState: PlayerState.PAUSED,
+            QMediaPlayer.BufferingState: PlayerState.PLAYING,
         }
         self._state = state_map.get(state, PlayerState.STOPPED)
         self._emit_state_changed()
@@ -104,6 +105,7 @@ class QtPlayer(PlayerBackend):
     
     def _on_qt_duration_changed(self, duration):
         self._duration = duration
+        self._emit_position_changed()
     
     def _on_error(self, error):
         if error != QMediaPlayer.NoError:

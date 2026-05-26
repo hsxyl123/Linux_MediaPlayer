@@ -324,8 +324,8 @@ class MainWindow(QMainWindow):
             self.controls.show_temp_message(text, color)
     
     def _on_position_changed(self, position, duration):
-        self.controls.update_position(position)
         self.controls.update_position_range(duration)
+        self.controls.update_position(position)
         self.controls.update_time_display(position, duration)
     
     def keyPressEvent(self, event):
