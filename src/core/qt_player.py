@@ -87,8 +87,7 @@ class QtPlayer(PlayerBackend):
     
     def set_video_output(self, widget) -> None:
         self._video_widget = widget
-        if isinstance(widget, QVideoWidget):
-            self._media_player.setVideoOutput(widget)
+        self._media_player.setVideoOutput(widget)
     
     def _on_qt_state_changed(self, state):
         state_map = {
