@@ -94,7 +94,6 @@ class QtPlayer(PlayerBackend):
             QMediaPlayer.StoppedState: PlayerState.STOPPED,
             QMediaPlayer.PlayingState: PlayerState.PLAYING,
             QMediaPlayer.PausedState: PlayerState.PAUSED,
-            QMediaPlayer.BufferingState: PlayerState.PLAYING,
         }
         self._state = state_map.get(state, PlayerState.STOPPED)
         self._emit_state_changed()
