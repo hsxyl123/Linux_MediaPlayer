@@ -4,8 +4,8 @@ Floating Controls - Modern Minimalist Design
 
 from PyQt5.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
                              QSlider, QLabel)
-from PyQt5.QtCore import Qt, pyqtSignal, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtCore import Qt, pyqtSignal, QTimer, QRect
+from PyQt5.QtGui import QFont, QLinearGradient, QPalette, QPainter, QColor
 
 
 class FloatingControls(QWidget):
@@ -21,8 +21,20 @@ class FloatingControls(QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
+        self.setAutoFillBackground(False)
         self._init_ui()
         self._apply_style()
+    
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0.0, QColor(15, 15, 15, 255))
+        gradient.setColorAt(0.45, QColor(10, 10, 10, 255))
+        gradient.setColorAt(1.0, QColor(5, 5, 5, 255))
+        painter.fillRect(event.rect(), gradient)
+        painter.end()
+        super().paintEvent(event)
     
     def _init_ui(self):
         self.setFixedHeight(120)
@@ -31,13 +43,11 @@ class FloatingControls(QWidget):
         main_layout.setContentsMargins(25, 12, 25, 18)
         main_layout.setSpacing(10)
         
-        # ========== 第一行：按钮 + 时间（上面） ==========
         controls_row = QWidget()
         controls_layout = QHBoxLayout(controls_row)
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(10)
         
-        # 左侧控制按钮组
         backward_btn = self._create_button("⏪")
         backward_btn.clicked.connect(lambda: self.position_changed.emit(
             max(0, self.position_slider.value() - 5000)))
@@ -70,7 +80,6 @@ class FloatingControls(QWidget):
         controls_layout.addWidget(subtitles_btn)
         controls_layout.addWidget(audio_btn)
         
-        # 中间时间显示
         controls_layout.addStretch()
         
         self.time_label = QLabel("0:00 / 0:00")
@@ -80,7 +89,7 @@ class FloatingControls(QWidget):
             font-family: 'Helvetica Neue', 'Arial', sans-serif;
             font-size: 14px;
             font-weight: 500;
-            background-color: rgba(0, 0, 0, 0.6);
+            background-color: rgba(30, 30, 30, 255);
             padding: 6px 16px;
             border-radius: 8px;
         """)
@@ -88,7 +97,6 @@ class FloatingControls(QWidget):
         controls_layout.addWidget(self.time_label)
         controls_layout.addStretch()
         
-        # 右侧功能按钮
         fullscreen_btn = self._create_button("⛶")
         fullscreen_btn.clicked.connect(lambda: self.fullscreen_clicked.emit())
         
@@ -105,7 +113,6 @@ class FloatingControls(QWidget):
         
         main_layout.addWidget(controls_row)
         
-        # ========== 第二行：进度条（最下面） ==========
         progress_row = QWidget()
         progress_layout = QHBoxLayout(progress_row)
         progress_layout.setContentsMargins(0, 5, 0, 0)
@@ -129,7 +136,6 @@ class FloatingControls(QWidget):
         main_layout.addWidget(progress_row)
     
     def _create_button(self, icon_text):
-        """创建极简圆形按钮"""
         btn = QPushButton(icon_text)
         btn.setFixedSize(44, 44)
         btn.setCursor(Qt.PointingHandCursor)
@@ -154,15 +160,9 @@ class FloatingControls(QWidget):
         return btn
     
     def _apply_style(self):
-        """应用半透明渐变样式"""
         self.setStyleSheet("""
             FloatingControls {
-                background: qlineargradient(
-                    x1:0, y1:0, x2:0, y2:1,
-                    stop:0 rgba(0, 0, 0, 0.55),
-                    stop:0.45 rgba(0, 0, 0, 0.8),
-                    stop:1 rgba(0, 0, 0, 0.92)
-                );
+                background: transparent;
                 border: none;
             }
             
@@ -243,7 +243,6 @@ class FloatingControls(QWidget):
         self.remaining_label.setText(f"-{remaining_str} | {duration_str}")
     
     def show_temp_message(self, text: str, color: str = "#ffffff", duration_ms=2000):
-        """临时状态显示"""
         pass
     
     @staticmethod

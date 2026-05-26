@@ -313,6 +313,9 @@ class MainWindow(QMainWindow):
         is_playing = state == PlayerState.PLAYING
         self.controls.update_play_button(is_playing)
         
+        if state == PlayerState.PLAYING:
+            self.controls.raise_()
+        
         status_map = {
             PlayerState.STOPPED: ("Stopped", "#888888"),
             PlayerState.PLAYING: ("▶ Playing", "#00ff88"),
