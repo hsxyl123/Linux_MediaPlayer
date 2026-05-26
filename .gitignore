@@ -31,3 +31,17 @@ config.json
 .pytest_cache/
 .coverage
 htmlcov/
+
+# tox 测试环境
+.tox/
+
+# 依赖锁定文件
+Pipfile.lock
+poetry.lock
+requirements-dev.txt
+
+# 类型检查缓存
+.mypy_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
