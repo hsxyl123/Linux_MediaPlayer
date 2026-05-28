@@ -129,10 +129,6 @@ class MainWindow(QMainWindow):
         """)
         open_btn.clicked.connect(self._open_file)
         
-        # 左侧箭头（Open旁边的下拉箭头）
-        arrow_label = QLabel("▼")
-        arrow_label.setStyleSheet("color: rgba(255,255,255,0.6); font-size: 10px;")
-        arrow_label.setAlignment(Qt.AlignLeft)
         
         # 中间: 标题
         title_label = QLabel("Video Player")
@@ -192,7 +188,6 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(4)
         left_layout.addWidget(open_btn)
-        left_layout.addWidget(arrow_label)
         
         right_group = QWidget()
         right_layout = QHBoxLayout(right_group)

@@ -69,16 +69,11 @@ class FloatingControls(QWidget):
         self.volume_slider.valueChanged.connect(
             lambda vol: self.volume_changed.emit(vol))
         
-        subtitles_btn = self._create_button("♾")
-        audio_btn = self._create_button("🔊")
-        
         controls_layout.addWidget(backward_btn)
         controls_layout.addWidget(self.play_btn)
         controls_layout.addWidget(forward_btn)
         controls_layout.addWidget(volume_icon)
         controls_layout.addWidget(self.volume_slider)
-        controls_layout.addWidget(subtitles_btn)
-        controls_layout.addWidget(audio_btn)
         
         controls_layout.addStretch()
         
@@ -100,16 +95,11 @@ class FloatingControls(QWidget):
         fullscreen_btn = self._create_button("⛶")
         fullscreen_btn.clicked.connect(lambda: self.fullscreen_clicked.emit())
         
-        loop_btn = self._create_button("⟳")
-        playlist_btn = self._create_button("☰")
+
         settings_btn = self._create_button("⚙")
-        pip_btn = self._create_button("⌘")
         
-        controls_layout.addWidget(fullscreen_btn)
-        controls_layout.addWidget(loop_btn)
-        controls_layout.addWidget(playlist_btn)
         controls_layout.addWidget(settings_btn)
-        controls_layout.addWidget(pip_btn)
+        controls_layout.addWidget(fullscreen_btn)
         
         main_layout.addWidget(controls_row)
         

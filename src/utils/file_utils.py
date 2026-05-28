@@ -8,7 +8,7 @@ import os
 VIDEO_EXTENSIONS = {
     '.mp4', '.avi', '.mkv', '.mov', '.wmv', 
     '.flv', '.webm', '.m4v', '.mpg', '.mpeg',
-    '.3gp', '.ts', '.mts', '.m2ts'
+    '.3gp', '.ts', '.mts', '.m2ts','.m4a'
 }
 
 
