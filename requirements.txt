@@ -1,8 +1,0 @@
-# Simple Video Player - Requirements
-
-# Core GUI Framework & Media Backend
-PyQt5>=5.15
-
-# For development and testing
-pytest>=7.0
-pytest-qt>=4.0
