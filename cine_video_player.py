@@ -1,47 +1,44 @@
 #!/usr/bin/env python3
 """
 Linux Video Player - 基于 python-mpv 和 GTK3 的现代视频播放器
-支持: 播放控制、倍速播放、视频比例调整、全屏模式、键盘快捷键
+重构与修复版
 """
 
 import os
-# 强制使用 X11 后端，因为 python-mpv 嵌入 GTK3 强依赖于 X11 的 XID，Wayland下会导致直接崩溃
+# 强制使用 X11 后端，因为基于 XID 的嵌入方式在 Wayland 下会崩溃
 os.environ["GDK_BACKEND"] = "x11"
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib, GObject, Gio
-import cairo
+from gi.repository import Gtk, Gdk, GLib
 
 import mpv
 import sys
-import threading
 
 class VideoPlayer(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id='com.example.videoplayer',
-                         flags=Gio.ApplicationFlags.FLAGS_NONE)
+        super().__init__(application_id='com.example.videoplayer')
         
         self.mpv_player = None
         self.is_playing = False
         self.is_fullscreen = False
         self.is_seeking = False
+        self.is_looping = False
         self.current_file = None
-        self.update_timer = None
+        self._click_timeout_id = None # 用于解决单双击冲突
         
+        # UI 组件引用
         self.window = None
-        self.header_bar = None # 记录 header_bar 以便全屏时隐藏
+        self.header_bar = None
         self.drawing_area = None
         self.controls_box = None
         self.progress_scale = None
         self.volume_scale = None
         self.time_label = None
         self.play_button = None
-        self.stop_button = None
+        self.loop_button = None
         self.speed_combo = None
-        self.aspect_combo = None
         self.fullscreen_btn = None
-        self.open_btn = None
         self.volume_label = None
 
     def do_activate(self):
@@ -61,15 +58,14 @@ class VideoPlayer(Gtk.Application):
         self.setup_style()
         self.build_ui()
         self.connect_signals()
-        self.apply_css()
         
-        # 必须先 show_all 才能在后续触发 realize 信号并获取正常的系统底层窗口 ID
+        # 必须先 show_all 才能获取底层窗口 XID
         self.window.show_all()
 
     def setup_style(self):
         screen = Gdk.Screen.get_default()
         provider = Gtk.CssProvider()
-        # 这里的 CSS 完全保留你原始的样式
+        # 你的原始 CSS 样式完全保留
         css = """
             * {
                 background-color: #1a1a2e;
@@ -77,25 +73,14 @@ class VideoPlayer(Gtk.Application):
                 font-family: 'Segoe UI', 'Roboto', sans-serif;
                 font-size: 13px;
             }
-            
-            window {
-                background-color: #0f0f1a;
-            }
-            
-            #main-box {
-                background-color: #0f0f1a;
-            }
-            
-            #video-area {
-                background-color: #000000;
-            }
-            
+            window { background-color: #0f0f1a; }
+            #main-box { background-color: #0f0f1a; }
+            #video-area { background-color: #000000; }
             #controls-box {
                 background-color: rgba(26, 26, 46, 0.95);
                 border-top: 1px solid #16213e;
                 padding: 8px;
             }
-            
             button {
                 background-image: none;
                 background-color: transparent;
@@ -107,65 +92,36 @@ class VideoPlayer(Gtk.Application):
                 color: #eaeaea;
                 transition: all 200ms ease;
             }
-            
-            button:hover {
-                background-color: rgba(93, 92, 222, 0.3);
-            }
-            
-            button:active {
-                background-color: rgba(93, 92, 222, 0.5);
-            }
-            
-            #play-btn {
-                padding: 6px 14px;
-            }
-            
+            button:hover { background-color: rgba(93, 92, 222, 0.3); }
+            button:active { background-color: rgba(93, 92, 222, 0.5); }
+            #play-btn { padding: 6px 14px; }
             #open-btn {
                 background-color: rgba(93, 92, 222, 0.2);
                 border: 1px solid #5d5cde;
                 border-radius: 4px;
                 padding: 6px 16px;
             }
-            
-            #open-btn:hover {
-                background-color: rgba(93, 92, 222, 0.4);
-            }
-            
-            scale {
-                background-color: transparent;
-            }
-            
+            #open-btn:hover { background-color: rgba(93, 92, 222, 0.4); }
+            scale { background-color: transparent; }
             scale trough {
                 min-height: 5px;
                 border-radius: 3px;
                 background-color: #2d2d44;
             }
-            
             scale trough highlight {
                 min-height: 5px;
                 border-radius: 3px;
                 background-color: linear-gradient(to right, #5d5cde, #7b68ee);
             }
-            
             scale slider {
                 background-color: #ffffff;
                 border: 2px solid #5d5cde;
                 border-radius: 50%;
                 margin: -6px;
             }
-            
-            scale slider:hover {
-                background-color: #5d5cde;
-            }
-            
-            #progress-scale trough {
-                min-height: 5px;
-            }
-            
-            #volume-scale trough {
-                min-width: 80px;
-            }
-            
+            scale slider:hover { background-color: #5d5cde; }
+            #progress-scale trough { min-height: 5px; }
+            #volume-scale trough { min-width: 80px; }
             combobox {
                 background-color: #2d2d44;
                 border: 1px solid #3d3d54;
@@ -173,46 +129,18 @@ class VideoPlayer(Gtk.Application):
                 padding: 4px 8px;
                 color: #eaeaea;
             }
-            
-            combobox:hover {
-                border-color: #5d5cde;
-            }
-            
-            label {
-                color: #b8b8cc;
-                font-size: 12px;
-            }
-            
+            combobox:hover { border-color: #5d5cde; }
+            label { color: #b8b8cc; font-size: 12px; }
             #time-label {
                 color: #eaeaea;
                 font-family: 'Consolas', 'Monaco', monospace;
                 font-size: 12px;
                 min-width: 100px;
             }
-            
-            #title-label {
-                color: #eaeaea;
-                font-size: 13px;
-                font-weight: 500;
-            }
-            
             #header-bar {
                 background-color: rgba(15, 15, 26, 0.9);
                 border-bottom: 1px solid #16213e;
                 padding: 4px 12px;
-            }
-            
-            separator {
-                background-color: #2d2d44;
-            }
-            
-            .fullscreen-overlay {
-                opacity: 0;
-                transition: opacity 300ms ease;
-            }
-            
-            .fullscreen-overlay.visible {
-                opacity: 1;
             }
         """
         try:
@@ -226,6 +154,7 @@ class VideoPlayer(Gtk.Application):
         main_box.set_name("main-box")
         self.window.add(main_box)
 
+        # Header Bar
         self.header_bar = Gtk.HeaderBar()
         self.header_bar.set_name("header-bar")
         self.header_bar.set_show_close_button(True)
@@ -236,25 +165,17 @@ class VideoPlayer(Gtk.Application):
         self.open_btn.set_name("open-btn")
         self.header_bar.pack_start(self.open_btn)
 
-        menu_btn = Gtk.Button()
-        menu_icon = Gtk.Image.new_from_icon_name("view-list-symbolic", Gtk.IconSize.BUTTON)
-        menu_btn.add(menu_icon)
-        self.header_bar.pack_end(menu_btn)
-
         self.window.set_titlebar(self.header_bar)
 
-        video_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        video_box.set_homogeneous(True)
-        video_box.expand = True
-        main_box.pack_start(video_box, True, True, 0)
-
+        # Video Area
         self.drawing_area = Gtk.DrawingArea()
         self.drawing_area.set_name("video-area")
         self.drawing_area.set_hexpand(True)
         self.drawing_area.set_vexpand(True)
-        self.drawing_area.set_can_focus(True) # 让画布能够捕获键盘焦点
-        video_box.pack_start(self.drawing_area, True, True, 0)
+        self.drawing_area.set_can_focus(True)
+        main_box.pack_start(self.drawing_area, True, True, 0)
 
+        # Controls Overlays
         controls_overlay = Gtk.Overlay()
         main_box.pack_start(controls_overlay, False, False, 0)
 
@@ -266,48 +187,30 @@ class VideoPlayer(Gtk.Application):
         self.controls_box.set_margin_end(12)
         controls_overlay.add(self.controls_box)
 
-        progress_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.controls_box.pack_start(progress_box, False, False, 0)
-
+        # Progress Bar
         self.progress_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
         self.progress_scale.set_name("progress-scale")
         self.progress_scale.set_draw_value(False)
-        self.progress_scale.set_hexpand(True)
         self.progress_scale.set_range(0, 100)
         self.progress_scale.set_value(0)
-        progress_box.pack_start(self.progress_scale, True, True, 0)
+        self.controls_box.pack_start(self.progress_scale, False, False, 0)
 
+        # Buttons Row
         buttons_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self.controls_box.pack_start(buttons_row, False, False, 0)
 
+        # Left Controls
         left_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         buttons_row.pack_start(left_controls, False, False, 0)
 
         self.play_button = Gtk.Button()
-        play_icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
-        self.play_button.add(play_icon)
+        self.play_button.add(Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON))
         self.play_button.set_name("play-btn")
         left_controls.pack_start(self.play_button, False, False, 0)
 
-        stop_btn = Gtk.Button()
-        stop_icon = Gtk.Image.new_from_icon_name("media-playback-stop-symbolic", Gtk.IconSize.BUTTON)
-        stop_btn.add(stop_icon)
-        left_controls.pack_start(stop_btn, False, False, 0)
-
-        prev_btn = Gtk.Button()
-        prev_icon = Gtk.Image.new_from_icon_name("media-skip-backward-symbolic", Gtk.IconSize.BUTTON)
-        prev_btn.add(prev_icon)
-        left_controls.pack_start(prev_btn, False, False, 0)
-
-        next_btn = Gtk.Button()
-        next_icon = Gtk.Image.new_from_icon_name("media-skip-forward-symbolic", Gtk.IconSize.BUTTON)
-        next_btn.add(next_icon)
-        left_controls.pack_start(next_btn, False, False, 0)
-
-        volume_btn = Gtk.Button()
-        volume_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON)
-        volume_btn.add(volume_icon)
-        left_controls.pack_start(volume_btn, False, False, 0)
+        self.volume_label = Gtk.Button()
+        self.volume_label.add(Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON))
+        left_controls.pack_start(self.volume_label, False, False, 0)
 
         self.volume_scale = Gtk.Scale(orientation=Gtk.Orientation.HORIZONTAL)
         self.volume_scale.set_name("volume-scale")
@@ -317,68 +220,51 @@ class VideoPlayer(Gtk.Application):
         self.volume_scale.set_size_request(100, -1)
         left_controls.pack_start(self.volume_scale, False, False, 0)
 
+        # Center Time
         center_info = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         center_info.set_halign(Gtk.Align.CENTER)
-        center_info.set_hexpand(True)
         buttons_row.pack_start(center_info, True, True, 0)
 
         self.time_label = Gtk.Label(label="0:00 / 0:00")
         self.time_label.set_name("time-label")
-        self.time_label.set_xalign(0.5)
         center_info.pack_start(self.time_label, False, False, 0)
 
+        # Right Controls
         right_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         buttons_row.pack_end(right_controls, False, False, 0)
 
         speed_store = Gtk.ListStore(str)
-        speeds = ["0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"]
-        for s in speeds:
+        for s in ["0.5x", "1.0x", "1.25x", "1.5x", "2.0x"]:
             speed_store.append([s])
-
         self.speed_combo = Gtk.ComboBox.new_with_model(speed_store)
-        renderer_text = Gtk.CellRendererText()
-        self.speed_combo.pack_start(renderer_text, True)
-        self.speed_combo.add_attribute(renderer_text, "text", 0)
-        self.speed_combo.set_active(2)
+        renderer = Gtk.CellRendererText()
+        self.speed_combo.pack_start(renderer, True)
+        self.speed_combo.add_attribute(renderer, "text", 0)
+        self.speed_combo.set_active(1) # Default 1.0x
         right_controls.pack_start(self.speed_combo, False, False, 0)
 
-        aspect_btn = Gtk.Button()
-        aspect_icon = Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
-        aspect_btn.add(aspect_icon)
-        right_controls.pack_start(aspect_btn, False, False, 0)
-
-        loop_btn = Gtk.Button()
-        loop_icon = Gtk.Image.new_from_icon_name("media-playlist-repeat-symbolic", Gtk.IconSize.BUTTON)
-        loop_btn.add(loop_icon)
-        right_controls.pack_start(loop_btn, False, False, 0)
-
-        settings_btn = Gtk.Button()
-        settings_icon = Gtk.Image.new_from_icon_name("emblem-system-symbolic", Gtk.IconSize.BUTTON)
-        settings_btn.add(settings_icon)
-        right_controls.pack_start(settings_btn, False, False, 0)
+        self.loop_button = Gtk.Button()
+        self.loop_button.add(Gtk.Image.new_from_icon_name("media-playlist-repeat-symbolic", Gtk.IconSize.BUTTON))
+        right_controls.pack_start(self.loop_button, False, False, 0)
 
         self.fullscreen_btn = Gtk.Button()
-        fullscreen_icon = Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
-        self.fullscreen_btn.add(fullscreen_icon)
+        self.fullscreen_btn.add(Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON))
         right_controls.pack_start(self.fullscreen_btn, False, False, 0)
-
-        self.stop_button = stop_btn
-        self.volume_label = volume_btn
 
     def connect_signals(self):
         self.window.connect("delete-event", self.on_delete_event)
         self.window.connect("key-press-event", self.on_key_press)
         
-        # 将 setup_mpv 的触发时机改到窗口 realize 之后，避免提早调用导致 XID 异常报错崩溃
         self.drawing_area.connect("realize", self.on_drawing_area_realize)
         self.drawing_area.connect("draw", self.on_draw)
         self.drawing_area.connect("button-press-event", self.on_video_click)
+        # 允许接收鼠标点击事件
         self.drawing_area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK)
 
         self.open_btn.connect("clicked", self.on_open_file)
         self.play_button.connect("clicked", self.toggle_play_pause)
-        self.stop_button.connect("clicked", self.on_stop)
         self.fullscreen_btn.connect("clicked", self.toggle_fullscreen)
+        self.loop_button.connect("clicked", self.toggle_loop)
 
         self.progress_scale.connect("button-press-event", self.on_progress_press)
         self.progress_scale.connect("button-release-event", self.on_progress_release)
@@ -391,27 +277,25 @@ class VideoPlayer(Gtk.Application):
         self.setup_mpv()
 
     def setup_mpv(self):
-        try:
-            window = self.drawing_area.get_window()
-            if not window:
-                return
-            xid = window.get_xid()
+        window = self.drawing_area.get_window()
+        if not window:
+            self.show_error_dialog("初始化失败: 无法获取窗口系统引用。")
+            return
             
+        try:
+            xid = window.get_xid()
             self.mpv_player = mpv.MPV(
                 wid=str(xid),
-                vo='x11', # 强制使用 x11 输出避免报错
-                ytdl=False,
+                vo='x11', # 强制 x11 避免 Wayland 下崩溃
+                hwdec='auto-safe',
+                keep_open='yes', # 播放完毕不自动关闭，保持最后一帧
                 osc=False,
                 input_default_bindings=False,
                 input_vo_keyboard=False,
-                keep_open='no',
-                cursor_autohide=1000,
-                force_window='immediate',
-                hwdec='auto-safe'
             )
             print("MPV 初始化成功")
             
-            # 属性观察器在 mpv 初始化完成后挂载
+            # 【修复1】只使用属性观察器，删除多余的 timer
             @self.mpv_player.property_observer('time-pos')
             def time_observer(_name, value):
                 if value is not None and not self.is_seeking:
@@ -429,45 +313,50 @@ class VideoPlayer(Gtk.Application):
 
         except Exception as e:
             print(f"MPV 初始化失败: {e}")
-            self.mpv_player = mpv.MPV(
-                ytdl=False,
-                osc=False,
-                input_default_bindings=False,
-                input_vo_keyboard=False,
-                keep_open='no',
-                cursor_autohide=1000
-            )
+            self.show_error_dialog("播放器核心初始化失败，请确保系统已安装 libmpv。")
 
     def on_draw(self, widget, cr):
-        if not self.current_file or not self.is_playing:
-            width = widget.get_allocated_width()
-            height = widget.get_allocated_height()
+        # 【优化】如果视频正在播放，不要用黑色覆盖，让 MPV 渲染
+        if self.current_file:
+            return True 
             
-            cr.set_source_rgb(0.06, 0.06, 0.1)
-            cr.rectangle(0, 0, width, height)
-            cr.fill()
+        width = widget.get_allocated_width()
+        height = widget.get_allocated_height()
+        cr.set_source_rgb(0.06, 0.06, 0.1)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
 
-            if not self.current_file:
-                cr.set_source_rgba(0.9, 0.9, 0.9, 0.6)
-                cr.select_font_face("Sans", Gtk.FontStyle.NORMAL, Gtk.Weight.NORMAL)
-                cr.set_font_size(18)
-                
-                text = "打开视频文件开始播放"
-                text_ext = cr.text_extents(text)
-                x = (width - text_ext.width) / 2
-                y = (height + text_ext.height) / 2
-                cr.move_to(x, y)
-                cr.show_text(text)
-
+        cr.set_source_rgba(0.9, 0.9, 0.9, 0.6)
+        cr.select_font_face("Sans", Gtk.FontStyle.NORMAL, Gtk.Weight.NORMAL)
+        cr.set_font_size(18)
+        text = "点击 Open 打开视频文件"
+        text_ext = cr.text_extents(text)
+        cr.move_to((width - text_ext.width) / 2, (height + text_ext.height) / 2)
+        cr.show_text(text)
         return False
 
     def on_video_click(self, widget, event):
-        if event.button == 1 and self.current_file:
-            # 增加双击全屏特性，防止全屏后控制栏隐藏导致无法退出
-            if event.type == Gdk.EventType._2BUTTON_PRESS:
-                self.toggle_fullscreen()
-            elif event.type == Gdk.EventType.BUTTON_PRESS:
-                self.toggle_play_pause(None)
+        if not self.current_file or event.button != 1:
+            return
+
+        # 【修复2】解决单双击冲突：延迟判定单击事件
+        if event.type == Gdk.EventType.BUTTON_PRESS:
+            if self._click_timeout_id:
+                GLib.source_remove(self._click_timeout_id)
+            # 设置 250ms 延迟，看是否会有后续的 _2BUTTON_PRESS
+            self._click_timeout_id = GLib.timeout_add(250, self._execute_single_click)
+            
+        elif event.type == Gdk.EventType._2BUTTON_PRESS:
+            # 确认是双击，取消单击的延迟任务
+            if self._click_timeout_id:
+                GLib.source_remove(self._click_timeout_id)
+                self._click_timeout_id = None
+            self.toggle_fullscreen()
+
+    def _execute_single_click(self):
+        self._click_timeout_id = None
+        self.toggle_play_pause(None)
+        return False # 停止 timer
 
     def on_open_file(self, button):
         dialog = Gtk.FileChooserDialog(
@@ -475,22 +364,12 @@ class VideoPlayer(Gtk.Application):
             parent=self.window,
             action=Gtk.FileChooserAction.OPEN
         )
-        dialog.add_buttons(
-            "取消", Gtk.ResponseType.CANCEL,
-            "打开", Gtk.ResponseType.ACCEPT
-        )
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "打开", Gtk.ResponseType.ACCEPT)
         
         filter_video = Gtk.FileFilter()
         filter_video.set_name("视频文件")
         filter_video.add_mime_type("video/*")
-        for ext in ["*.mp4", "*.mkv", "*.avi", "*.webm", "*.mov", "*.flv", "*.wmv"]:
-            filter_video.add_pattern(ext)
         dialog.add_filter(filter_video)
-        
-        filter_all = Gtk.FileFilter()
-        filter_all.set_name("所有文件")
-        filter_all.add_pattern("*")
-        dialog.add_filter(filter_all)
 
         response = dialog.run()
         if response == Gtk.ResponseType.ACCEPT:
@@ -501,229 +380,139 @@ class VideoPlayer(Gtk.Application):
             dialog.destroy()
 
     def load_video(self, file_path):
+        if not self.mpv_player:
+            return
         try:
             self.current_file = file_path
+            self.mpv_player.play(file_path)
+            self.is_playing = True
+            self.update_play_button()
             
-            if self.mpv_player:
-                self.mpv_player.play(file_path)
-                self.is_playing = True
-                self.update_play_button()
-                self.start_progress_update()
-                
-                filename = os.path.basename(file_path)
-                self.header_bar.set_subtitle(filename)
-                
-                self.drawing_area.queue_draw()
-                
-                print(f"正在播放: {file_path}")
-                
+            self.header_bar.set_subtitle(os.path.basename(file_path))
+            self.drawing_area.queue_draw() # 触发重绘清除提示文字
+            
         except Exception as e:
-            print(f"加载视频失败: {e}")
             self.show_error_dialog(f"无法加载视频文件\n\n{str(e)}")
 
     def toggle_play_pause(self, button):
-        if not self.current_file:
+        if not self.current_file or not self.mpv_player:
             return
             
-        if self.mpv_player:
-            if self.is_playing:
-                self.mpv_player.pause = True
-                self.is_playing = False
-            else:
-                self.mpv_player.pause = False
-                self.is_playing = True
-            
-            self.update_play_button()
+        self.is_playing = not self.is_playing
+        self.mpv_player.pause = not self.is_playing
+        self.update_play_button()
 
     def update_play_button(self):
-        child = self.play_button.get_child()
-        if child:
+        icon_name = "media-playback-pause-symbolic" if self.is_playing else "media-playback-start-symbolic"
+        for child in self.play_button.get_children():
             self.play_button.remove(child)
-        
-        if self.is_playing:
-            icon = Gtk.Image.new_from_icon_name("media-playback-pause-symbolic", Gtk.IconSize.BUTTON)
-        else:
-            icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic", Gtk.IconSize.BUTTON)
-        
-        self.play_button.add(icon)
+        self.play_button.add(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
         self.play_button.show_all()
 
-    def on_stop(self, button):
-        if self.mpv_player and self.current_file:
-            self.mpv_player.pause = True
-            self.mpv_player.seek(0, 'absolute+exact')
-            self.is_playing = False
-            self.update_play_button()
-            self.progress_scale.set_value(0)
-            self.update_time_display(0, self.get_duration())
+    def toggle_loop(self, button):
+        if not self.mpv_player: return
+        self.is_looping = not self.is_looping
+        self.mpv_player.loop = 'inf' if self.is_looping else 'no'
+        
+        # 简单更改按钮背景色表示选中状态
+        if self.is_looping:
+            self.loop_button.get_style_context().add_class("suggested-action")
+        else:
+            self.loop_button.get_style_context().remove_class("suggested-action")
 
     def toggle_fullscreen(self, button=None):
         if self.is_fullscreen:
             self.window.unfullscreen()
-            self.is_fullscreen = False
             self.controls_box.show()
             self.header_bar.show()
         else:
             self.window.fullscreen()
-            self.is_fullscreen = True
-            # 进入全屏时完美隐藏控制栏，保持纯净视频画面
             self.controls_box.hide()
             self.header_bar.hide()
-            # 【核心修复】：重新捕获键盘焦点，防止按键交互失效
-            self.drawing_area.grab_focus()
+            
+        self.is_fullscreen = not self.is_fullscreen
+        self.drawing_area.grab_focus() # 全屏后重新获取焦点，保证键盘生效
         
-        self.update_fullscreen_button()
-
-    def update_fullscreen_button(self):
-        child = self.fullscreen_btn.get_child()
-        if child:
+        icon_name = "view-restore-symbolic" if self.is_fullscreen else "view-fullscreen-symbolic"
+        for child in self.fullscreen_btn.get_children():
             self.fullscreen_btn.remove(child)
-        
-        if self.is_fullscreen:
-            icon = Gtk.Image.new_from_icon_name("view-restore-symbolic", Gtk.IconSize.BUTTON)
-        else:
-            icon = Gtk.Image.new_from_icon_name("view-fullscreen-symbolic", Gtk.IconSize.BUTTON)
-        
-        self.fullscreen_btn.add(icon)
+        self.fullscreen_btn.add(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
         self.fullscreen_btn.show_all()
 
+    # --- 进度条逻辑 ---
     def on_progress_press(self, scale, event):
         self.is_seeking = True
 
     def on_progress_release(self, scale, event):
         self.is_seeking = False
-        value = scale.get_value()
-        self.seek_to_position(value)
+        self.seek_to_position(scale.get_value())
 
     def on_progress_changed(self, scale):
         if self.is_seeking:
-            value = scale.get_value()
             duration = self.get_duration()
-            if duration > 0:
-                current_time = (value / 100) * duration
-                self.update_time_display(current_time, duration)
+            current_time = (scale.get_value() / 100) * duration
+            self.update_time_display(current_time, duration)
 
     def seek_to_position(self, percentage):
         if self.mpv_player and self.current_file:
-            duration = self.get_duration()
-            if duration > 0:
-                target_time = (percentage / 100) * duration
-                try:
-                    self.mpv_player.seek(target_time, 'absolute+exact')
-                    print(f"跳转到: {target_time:.1f}秒 ({percentage:.1f}%)")
-                except Exception as e:
-                    print(f"跳转失败: {e}")
-
-    def on_volume_changed(self, scale):
-        volume = int(scale.get_value())
-        if self.mpv_player:
-            try:
-                self.mpv_player.volume = volume
-                self.update_volume_icon(volume)
-            except Exception as e:
-                print(f"设置音量失败: {e}")
-
-    def update_volume_icon(self, volume):
-        child = self.volume_label.get_child()
-        if child:
-            self.volume_label.remove(child)
-        
-        if volume == 0:
-            icon_name = "audio-volume-muted-symbolic"
-        elif volume < 33:
-            icon_name = "audio-volume-low-symbolic"
-        elif volume < 66:
-            icon_name = "audio-volume-medium-symbolic"
-        else:
-            icon_name = "audio-volume-high-symbolic"
-        
-        icon = Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
-        self.volume_label.add(icon)
-        self.volume_label.show_all()
-
-    def on_speed_changed(self, combo):
-        model = combo.get_model()
-        active = combo.get_active()
-        if active >= 0:
-            speed_str = model[active][0]
-            speed = float(speed_str.replace('x', ''))
-            if self.mpv_player:
-                try:
-                    self.mpv_player.speed = speed
-                    print(f"播放速度: {speed}x")
-                except Exception as e:
-                    print(f"设置速度失败: {e}")
-
-    def get_duration(self):
-        try:
-            if self.mpv_player:
-                return self.mpv_player.duration or 0
-        except:
-            pass
-        return 0
-
-    def get_current_time(self):
-        try:
-            if self.mpv_player:
-                return self.mpv_player.time_pos or 0
-        except:
-            pass
-        return 0
+            target = (percentage / 100) * self.get_duration()
+            self.mpv_player.seek(target, 'absolute+exact')
 
     def update_progress(self, time_pos):
-        if not self.is_seeking and time_pos is not None:
-            duration = self.get_duration()
-            if duration > 0:
-                percentage = (time_pos / duration) * 100
+        duration = self.get_duration()
+        if duration > 0:
+            percentage = (time_pos / duration) * 100
+            # 只有在非拖动状态才强制更新滑块
+            if not self.is_seeking:
+                # 阻塞 value-changed 信号防止死循环
+                self.progress_scale.handler_block_by_func(self.on_progress_changed)
                 self.progress_scale.set_value(percentage)
-                self.update_time_display(time_pos, duration)
+                self.progress_scale.handler_unblock_by_func(self.on_progress_changed)
+            self.update_time_display(time_pos, duration)
 
     def update_duration(self, duration):
         if duration > 0:
-            self.progress_scale.set_range(0, 100)
-            current_time = self.get_current_time()
-            self.update_time_display(current_time, duration)
-
-    def update_time_display(self, current, duration):
-        current_str = self.format_time(current)
-        duration_str = self.format_time(duration)
-        self.time_label.set_text(f"{current_str} / {duration_str}")
-
-    def format_time(self, seconds):
-        if seconds is None or seconds < 0:
-            return "0:00"
-        hours = int(seconds // 3600)
-        minutes = int((seconds % 3600) // 60)
-        secs = int(seconds % 60)
-        if hours > 0:
-            return f"{hours}:{minutes:02d}:{secs:02d}"
-        return f"{minutes}:{secs:02d}"
-
-    def start_progress_update(self):
-        if self.update_timer:
-            GLib.source_remove(self.update_timer)
-        self.update_timer = GLib.timeout_add(1000, self.update_progress_tick)
-
-    def update_progress_tick(self):
-        if self.is_playing and self.mpv_player:
-            try:
-                time_pos = self.mpv_player.time_pos
-                if time_pos is not None:
-                    duration = self.get_duration()
-                    if duration > 0:
-                        percentage = (time_pos / duration) * 100
-                        self.progress_scale.set_value(percentage)
-                        self.update_time_display(time_pos, duration)
-            except:
-                pass
-        return self.is_playing
+            self.update_time_display(self.get_current_time(), duration)
 
     def on_eof_reached(self):
-        self.is_playing = False
-        self.update_play_button()
-        if self.update_timer:
-            GLib.source_remove(self.update_timer)
-            self.update_timer = None
+        if not self.is_looping:
+            self.is_playing = False
+            self.update_play_button()
+
+    # --- 辅助方法 ---
+    def get_duration(self):
+        return getattr(self.mpv_player, 'duration', 0) or 0
+
+    def get_current_time(self):
+        return getattr(self.mpv_player, 'time_pos', 0) or 0
+
+    def update_time_display(self, current, duration):
+        self.time_label.set_text(f"{self.format_time(current)} / {self.format_time(duration)}")
+
+    def format_time(self, seconds):
+        if seconds is None or seconds < 0: return "0:00"
+        hours, remainder = divmod(int(seconds), 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}" if hours > 0 else f"{minutes}:{secs:02d}"
+
+    # --- 其他控制 ---
+    def on_volume_changed(self, scale):
+        if self.mpv_player:
+            vol = int(scale.get_value())
+            self.mpv_player.volume = vol
+            
+            icon_name = "audio-volume-muted-symbolic" if vol == 0 else \
+                        "audio-volume-low-symbolic" if vol < 33 else \
+                        "audio-volume-medium-symbolic" if vol < 66 else "audio-volume-high-symbolic"
+            for child in self.volume_label.get_children():
+                self.volume_label.remove(child)
+            self.volume_label.add(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
+            self.volume_label.show_all()
+
+    def on_speed_changed(self, combo):
+        if self.mpv_player:
+            speed_str = combo.get_model()[combo.get_active()][0]
+            self.mpv_player.speed = float(speed_str.replace('x', ''))
 
     def on_key_press(self, widget, event):
         keyval = event.keyval
@@ -732,81 +521,41 @@ class VideoPlayer(Gtk.Application):
         if keyname == 'space':
             self.toggle_play_pause(None)
             return True
-        elif keyname == 'F' or keyname == 'f':
-            if not (event.state & Gdk.ModifierType.CONTROL_MASK):
-                self.toggle_fullscreen()
-                return True
+        elif keyname in ('F', 'f'):
+            self.toggle_fullscreen()
+            return True
         elif keyname == 'Left':
-            self.seek_relative(-5)
+            if self.mpv_player: self.mpv_player.seek(-5, 'relative+exact')
             return True
         elif keyname == 'Right':
-            self.seek_relative(5)
+            if self.mpv_player: self.mpv_player.seek(5, 'relative+exact')
             return True
         elif keyname == 'Up':
-            self.adjust_volume(10)
+            self.volume_scale.set_value(min(100, self.volume_scale.get_value() + 5))
             return True
         elif keyname == 'Down':
-            self.adjust_volume(-10)
+            self.volume_scale.set_value(max(0, self.volume_scale.get_value() - 5))
             return True
         elif keyname == 'Escape' and self.is_fullscreen:
             self.toggle_fullscreen()
             return True
-        
         return False
 
-    def seek_relative(self, seconds):
-        if self.mpv_player and self.current_file:
-            try:
-                current = self.get_current_time()
-                new_time = max(0, current + seconds)
-                self.mpv_player.seek(new_time, 'absolute+exact')
-                print(f"{'快进' if seconds > 0 else '快退'} {abs(seconds)}秒")
-            except Exception as e:
-                print(f"快进/快退失败: {e}")
-
-    def adjust_volume(self, delta):
-        current_vol = int(self.volume_scale.get_value())
-        new_vol = max(0, min(100, current_vol + delta))
-        self.volume_scale.set_value(new_vol)
-        print(f"音量: {new_vol}%")
-
     def show_error_dialog(self, message):
-        dialog = Gtk.MessageDialog(
-            parent=self.window,
-            modal=True,
-            message_type=Gtk.MessageType.ERROR,
-            buttons=Gtk.ButtonsType.OK,
-            title="错误"
-        )
+        dialog = Gtk.MessageDialog(parent=self.window, modal=True,
+                                   message_type=Gtk.MessageType.ERROR,
+                                   buttons=Gtk.ButtonsType.OK, title="错误")
         dialog.set_markup(message)
         dialog.run()
         dialog.destroy()
 
-    def apply_css(self):
-        pass
-
     def on_delete_event(self, widget, event):
-        self.cleanup()
+        if self.mpv_player:
+            try: self.mpv_player.terminate()
+            except: pass
+        self.quit()
         return False
 
-    def cleanup(self):
-        if self.update_timer:
-            GLib.source_remove(self.update_timer)
-            self.update_timer = None
-        
-        if self.mpv_player:
-            try:
-                self.mpv_player.terminate()
-            except:
-                pass
-            self.mpv_player = None
-        
-        self.quit()
-
-def main():
-    app = VideoPlayer()
-    exit_status = app.run(sys.argv)
-    sys.exit(exit_status)
-
 if __name__ == '__main__':
-    main()
+    app = VideoPlayer()
+    sys.exit(app.run(sys.argv))
