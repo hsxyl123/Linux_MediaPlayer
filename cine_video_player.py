@@ -28,6 +28,7 @@ class VideoPlayer(Gtk.Application):
         self.is_looping = False
         self.is_playlist_visible = False
         self.current_file = None
+        self.last_volume = 100
         self.embedded_subtitles = []
         self.detected_subtitles = []
         self._click_timeout_id = None # 用于解决单双击冲突
@@ -130,6 +131,15 @@ class VideoPlayer(Gtk.Application):
             }
             #play-btn:active {
                 background-color: #e8ebf0;
+            }
+            #volume-btn {
+                box-shadow: none;
+                outline-style: none;
+            }
+            #volume-btn:focus {
+                box-shadow: none;
+                outline-style: none;
+                border-color: transparent;
             }
             #open-btn {
                 background-color: #ffffff;
@@ -372,6 +382,8 @@ class VideoPlayer(Gtk.Application):
 
         self.volume_label = Gtk.Button()
         self.volume_label.add(Gtk.Image.new_from_icon_name("audio-volume-high-symbolic", Gtk.IconSize.BUTTON))
+        self.volume_label.set_name("volume-btn")
+        self.volume_label.set_can_focus(False)
         self.volume_label.set_tooltip_text("音量")
         left_controls.pack_start(self.volume_label, False, False, 0)
 
@@ -448,6 +460,7 @@ class VideoPlayer(Gtk.Application):
         self.playlist_button.connect("clicked", self.toggle_playlist)
         self.playlist_view.connect("row-activated", self.on_playlist_row_activated)
         self.play_button.connect("clicked", self.toggle_play_pause)
+        self.volume_label.connect("clicked", self.toggle_mute)
         self.subtitle_button.connect("clicked", self.on_subtitle_button_clicked)
         self.fullscreen_btn.connect("clicked", self.toggle_fullscreen)
         self.loop_button.connect("clicked", self.toggle_loop)
@@ -958,14 +971,27 @@ class VideoPlayer(Gtk.Application):
         if self.mpv_player:
             vol = int(scale.get_value())
             self.mpv_player.volume = vol
-            
-            icon_name = "audio-volume-muted-symbolic" if vol == 0 else \
-                        "audio-volume-low-symbolic" if vol < 33 else \
-                        "audio-volume-medium-symbolic" if vol < 66 else "audio-volume-high-symbolic"
-            for child in self.volume_label.get_children():
-                self.volume_label.remove(child)
-            self.volume_label.add(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
-            self.volume_label.show_all()
+            if vol > 0:
+                self.last_volume = vol
+            self.update_volume_icon(vol)
+
+    def toggle_mute(self, button):
+        current_volume = int(self.volume_scale.get_value())
+        if current_volume > 0:
+            self.last_volume = current_volume
+            self.volume_scale.set_value(0)
+        else:
+            restore_volume = self.last_volume if self.last_volume > 0 else 100
+            self.volume_scale.set_value(restore_volume)
+
+    def update_volume_icon(self, volume):
+        icon_name = "audio-volume-muted-symbolic" if volume == 0 else \
+                    "audio-volume-low-symbolic" if volume < 33 else \
+                    "audio-volume-medium-symbolic" if volume < 66 else "audio-volume-high-symbolic"
+        for child in self.volume_label.get_children():
+            self.volume_label.remove(child)
+        self.volume_label.add(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
+        self.volume_label.show_all()
 
     def on_speed_changed(self, combo):
         if self.mpv_player:
