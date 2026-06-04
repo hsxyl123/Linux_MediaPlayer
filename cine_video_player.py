@@ -6,6 +6,11 @@ Linux Video Player - 基于 python-mpv 和 GTK3 的现代视频播放器
 
 import os
 import json
+import hashlib
+import shutil
+import subprocess
+import tempfile
+import threading
 # 强制使用 X11 后端，因为基于 XID 的嵌入方式在 Wayland 下会崩溃
 os.environ["GDK_BACKEND"] = "x11"
 
@@ -15,7 +20,11 @@ from gi.repository import Gtk, Gdk, GLib, Pango
 
 import cairo
 import mpv
+import requests
 import sys
+
+WHISPER_API_BASE = os.getenv("WHISPER_API_BASE", "http://192.168.62.1:8000")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")
 
 class VideoPlayer(Gtk.Application):
     def __init__(self):
@@ -29,6 +38,7 @@ class VideoPlayer(Gtk.Application):
         self.is_playlist_visible = False
         self.current_file = None
         self.last_volume = 100
+        self.is_generating_ai_subtitle = False
         self.embedded_subtitles = []
         self.detected_subtitles = []
         self._click_timeout_id = None # 用于解决单双击冲突
@@ -52,6 +62,9 @@ class VideoPlayer(Gtk.Application):
         self.playlist_box = None
         self.playlist_view = None
         self.playlist_store = None
+        self.ai_subtitle_dialog = None
+        self.ai_subtitle_spinner = None
+        self.ai_subtitle_status_label = None
 
         self.history_file = self.get_history_file()
         self.play_history = self.load_play_history()
@@ -731,6 +744,22 @@ class VideoPlayer(Gtk.Application):
 
         menu.append(Gtk.SeparatorMenuItem())
 
+    def append_ai_subtitle_menu_items(self, menu):
+        cache_path = self.get_ai_subtitle_cache_path(self.current_file)
+        has_cache = bool(cache_path and os.path.exists(cache_path))
+        if has_cache:
+            cache_item = Gtk.MenuItem(label="加载 AI 字幕缓存")
+            cache_item.connect("activate", self.load_ai_subtitle_cache)
+            menu.append(cache_item)
+
+        generate_text = "重新生成 AI 字幕" if has_cache else "生成 AI 字幕"
+        generate_label = "正在生成 AI 字幕..." if self.is_generating_ai_subtitle else generate_text
+        generate_item = Gtk.MenuItem(label=generate_label)
+        generate_item.set_sensitive(not self.is_generating_ai_subtitle)
+        generate_item.connect("activate", self.on_generate_ai_subtitle)
+        menu.append(generate_item)
+        menu.append(Gtk.SeparatorMenuItem())
+
     def on_embedded_subtitle_menu_item_activate(self, item, subtitle):
         self.select_subtitle_track(subtitle["id"])
 
@@ -749,10 +778,6 @@ class VideoPlayer(Gtk.Application):
         if not self.current_file:
             return
 
-        if not self.embedded_subtitles and not self.detected_subtitles:
-            self.on_open_subtitle_file(None)
-            return
-
         menu = Gtk.Menu()
 
         self.append_subtitle_menu_items(
@@ -762,6 +787,7 @@ class VideoPlayer(Gtk.Application):
             self.on_embedded_subtitle_menu_item_activate
         )
         self.append_external_subtitle_file_items(menu)
+        self.append_ai_subtitle_menu_items(menu)
 
         external_item = Gtk.MenuItem(label="打开外部字幕...")
         external_item.connect("activate", self.on_open_subtitle_file)
@@ -776,6 +802,173 @@ class VideoPlayer(Gtk.Application):
 
     def on_subtitle_file_menu_item_activate(self, item, subtitle_path):
         self.load_subtitle(subtitle_path)
+
+    def get_ai_subtitle_cache_path(self, video_path):
+        if not video_path:
+            return None
+
+        try:
+            stat = os.stat(video_path)
+        except OSError:
+            return None
+
+        key_source = f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}"
+        cache_key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
+        cache_dir = os.path.join(GLib.get_user_cache_dir(), "cine-player", "ai-subtitles")
+        return os.path.join(cache_dir, f"{cache_key}.srt")
+
+    def has_ai_subtitle_cache(self):
+        cache_path = self.get_ai_subtitle_cache_path(self.current_file)
+        return bool(cache_path and os.path.exists(cache_path))
+
+    def load_ai_subtitle_cache(self, item=None):
+        cache_path = self.get_ai_subtitle_cache_path(self.current_file)
+        if cache_path and os.path.exists(cache_path):
+            self.load_subtitle(cache_path)
+        else:
+            self.show_error_dialog("没有找到 AI 字幕缓存。")
+
+    def set_subtitle_busy(self, is_busy, message=None):
+        self.is_generating_ai_subtitle = is_busy
+        self.subtitle_button.set_sensitive(not is_busy)
+        self.subtitle_button.set_tooltip_text(message or ("字幕" if not is_busy else "正在生成 AI 字幕..."))
+        return False
+
+    def check_whisper_service(self):
+        try:
+            response = requests.get(f"{WHISPER_API_BASE.rstrip('/')}/health", timeout=5)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"无法连接 Whisper 服务: {WHISPER_API_BASE}\n"
+                "请检查宿主机服务是否启动，以及虚拟机是否能访问 192.168.62.1:8000。"
+            ) from e
+
+    def extract_audio_for_ai_subtitle(self, video_path):
+        if not shutil.which("ffmpeg"):
+            raise RuntimeError("未找到 ffmpeg，请先安装: sudo apt install ffmpeg")
+
+        temp_file = tempfile.NamedTemporaryFile(prefix="cine-ai-subtitle-", suffix=".mp3", delete=False)
+        temp_audio_path = temp_file.name
+        temp_file.close()
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i", video_path,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-b:a", "64k",
+            temp_audio_path,
+        ]
+
+        try:
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except OSError as e:
+            try:
+                os.remove(temp_audio_path)
+            except OSError:
+                pass
+            raise RuntimeError(f"音频提取失败: {e}") from e
+
+        if result.returncode != 0:
+            try:
+                os.remove(temp_audio_path)
+            except OSError:
+                pass
+            error_text = result.stderr.strip() or "ffmpeg 未返回错误信息"
+            raise RuntimeError(f"音频提取失败\n\n{error_text[-1000:]}")
+
+        return temp_audio_path
+
+    def request_ai_subtitle(self, audio_path):
+        url = f"{WHISPER_API_BASE.rstrip('/')}/v1/audio/transcriptions"
+        headers = {}
+        api_key = os.getenv("WHISPER_API_KEY")
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        with open(audio_path, "rb") as audio_file:
+            files = {"file": (os.path.basename(audio_path), audio_file, "audio/mpeg")}
+            data = {
+                "model": WHISPER_MODEL,
+                "response_format": "srt",
+            }
+            try:
+                response = requests.post(url, headers=headers, files=files, data=data, timeout=None)
+                response.raise_for_status()
+            except requests.RequestException as e:
+                response_text = getattr(e.response, "text", "") if getattr(e, "response", None) else ""
+                detail = f"\n\n{response_text[:1000]}" if response_text else ""
+                raise RuntimeError(f"Whisper 转写请求失败: {e}{detail}") from e
+
+        subtitle_text = response.text.strip()
+        if not subtitle_text:
+            raise RuntimeError("Whisper 服务返回了空字幕。")
+        return subtitle_text
+
+    def generate_ai_subtitle_worker(self, video_path, cache_path):
+        temp_audio_path = None
+        try:
+            self.check_whisper_service()
+            temp_audio_path = self.extract_audio_for_ai_subtitle(video_path)
+            subtitle_text = self.request_ai_subtitle(temp_audio_path)
+
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write(subtitle_text)
+                if not subtitle_text.endswith("\n"):
+                    f.write("\n")
+
+            GLib.idle_add(self.on_ai_subtitle_generated, cache_path)
+        except Exception as e:
+            GLib.idle_add(self.on_ai_subtitle_generation_failed, str(e))
+        finally:
+            if temp_audio_path:
+                try:
+                    os.remove(temp_audio_path)
+                except OSError:
+                    pass
+
+    def on_ai_subtitle_generated(self, cache_path):
+        self.set_subtitle_busy(False)
+        self.update_subtitle_button()
+        self.load_subtitle(cache_path)
+        self.update_ai_subtitle_dialog_success()
+        return False
+
+    def on_ai_subtitle_generation_failed(self, message):
+        self.set_subtitle_busy(False)
+        self.update_subtitle_button()
+        self.close_ai_subtitle_dialog()
+        self.show_error_dialog(f"AI 字幕生成失败\n\n{message}")
+        return False
+
+    def on_generate_ai_subtitle(self, item=None):
+        if not self.current_file or self.is_generating_ai_subtitle:
+            return
+
+        cache_path = self.get_ai_subtitle_cache_path(self.current_file)
+        if not cache_path:
+            self.show_error_dialog("无法创建 AI 字幕缓存路径。")
+            return
+
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
+
+        video_path = self.current_file
+        self.set_subtitle_busy(True, "正在生成 AI 字幕...")
+        self.show_ai_subtitle_progress_dialog()
+        worker = threading.Thread(
+            target=self.generate_ai_subtitle_worker,
+            args=(video_path, cache_path),
+            daemon=True,
+        )
+        worker.start()
 
     def on_open_subtitle_file(self, item):
         dialog = Gtk.FileChooserDialog(
@@ -1053,6 +1246,79 @@ class VideoPlayer(Gtk.Application):
         dialog.set_markup(message)
         dialog.run()
         dialog.destroy()
+
+    def show_info_dialog(self, message):
+        dialog = Gtk.MessageDialog(parent=self.window, modal=True,
+                                   message_type=Gtk.MessageType.INFO,
+                                   buttons=Gtk.ButtonsType.OK, title="提示")
+        dialog.set_markup(message)
+        dialog.run()
+        dialog.destroy()
+
+    def show_ai_subtitle_progress_dialog(self):
+        self.close_ai_subtitle_dialog()
+
+        dialog = Gtk.Dialog(title="AI 字幕", parent=self.window, modal=False)
+        dialog.set_resizable(False)
+        dialog.set_default_size(320, 120)
+        dialog.connect("delete-event", self.on_ai_subtitle_dialog_delete)
+
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(18)
+        content.set_margin_bottom(18)
+        content.set_margin_left(18)
+        content.set_margin_right(18)
+
+        spinner = Gtk.Spinner()
+        spinner.start()
+        content.pack_start(spinner, False, False, 0)
+
+        label = Gtk.Label(label="正在生成 AI 字幕，请稍后")
+        label.set_xalign(0.5)
+        content.pack_start(label, False, False, 0)
+
+        self.ai_subtitle_dialog = dialog
+        self.ai_subtitle_spinner = spinner
+        self.ai_subtitle_status_label = label
+
+        dialog.show_all()
+
+    def on_ai_subtitle_dialog_delete(self, dialog, event):
+        if self.is_generating_ai_subtitle:
+            return True
+
+        self.ai_subtitle_dialog = None
+        self.ai_subtitle_spinner = None
+        self.ai_subtitle_status_label = None
+        return False
+
+    def update_ai_subtitle_dialog_success(self):
+        if not self.ai_subtitle_dialog:
+            self.show_info_dialog("AI 字幕生成成功，现在请重新点击播放按钮。")
+            return
+
+        if self.ai_subtitle_spinner:
+            self.ai_subtitle_spinner.stop()
+            self.ai_subtitle_spinner.hide()
+
+        if self.ai_subtitle_status_label:
+            self.ai_subtitle_status_label.set_text("AI 字幕生成成功，现在请重新点击播放按钮。")
+
+        self.ai_subtitle_dialog.add_button("确定", Gtk.ResponseType.OK)
+        self.ai_subtitle_dialog.connect("response", self.on_ai_subtitle_dialog_response)
+        self.ai_subtitle_dialog.show_all()
+
+    def on_ai_subtitle_dialog_response(self, dialog, response):
+        self.close_ai_subtitle_dialog()
+
+    def close_ai_subtitle_dialog(self):
+        if self.ai_subtitle_dialog:
+            self.ai_subtitle_dialog.destroy()
+
+        self.ai_subtitle_dialog = None
+        self.ai_subtitle_spinner = None
+        self.ai_subtitle_status_label = None
 
     def on_delete_event(self, widget, event):
         if self.mpv_player:
