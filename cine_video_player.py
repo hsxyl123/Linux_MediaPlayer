@@ -77,7 +77,7 @@ class VideoPlayer(Gtk.Application):
     def create_window(self):
         self.window = Gtk.ApplicationWindow(
             application=self,
-            title="Cine - Video Player",
+            title="Linux Player",
             default_width=1024,
             default_height=768
         )
@@ -309,7 +309,7 @@ class VideoPlayer(Gtk.Application):
         self.header_bar = Gtk.HeaderBar()
         self.header_bar.set_name("header-bar")
         self.header_bar.set_show_close_button(True)
-        self.header_bar.set_title("Cine Player")
+        self.header_bar.set_title("Linux Player")
         self.header_bar.set_subtitle("Ready")
 
         self.open_btn = Gtk.Button.new_with_label("Open")
@@ -576,7 +576,7 @@ class VideoPlayer(Gtk.Application):
         return False # 停止 timer
 
     def get_history_file(self):
-        config_dir = os.path.join(GLib.get_user_config_dir(), "cine-player")
+        config_dir = os.path.join(GLib.get_user_config_dir(), "linux-player")
         return os.path.join(config_dir, "history.json")
 
     def load_play_history(self):
@@ -814,7 +814,7 @@ class VideoPlayer(Gtk.Application):
 
         key_source = f"{os.path.abspath(video_path)}|{stat.st_size}|{stat.st_mtime_ns}"
         cache_key = hashlib.sha256(key_source.encode("utf-8")).hexdigest()
-        cache_dir = os.path.join(GLib.get_user_cache_dir(), "cine-player", "ai-subtitles")
+        cache_dir = os.path.join(GLib.get_user_cache_dir(), "linux-player", "ai-subtitles")
         return os.path.join(cache_dir, f"{cache_key}.srt")
 
     def has_ai_subtitle_cache(self):
@@ -848,7 +848,7 @@ class VideoPlayer(Gtk.Application):
         if not shutil.which("ffmpeg"):
             raise RuntimeError("未找到 ffmpeg，请先安装: sudo apt install ffmpeg")
 
-        temp_file = tempfile.NamedTemporaryFile(prefix="cine-ai-subtitle-", suffix=".mp3", delete=False)
+        temp_file = tempfile.NamedTemporaryFile(prefix="linux-ai-subtitle-", suffix=".mp3", delete=False)
         temp_audio_path = temp_file.name
         temp_file.close()
 
