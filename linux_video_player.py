@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 # 强制使用 X11 后端，因为基于 XID 的嵌入方式在 Wayland 下会崩溃
 os.environ["GDK_BACKEND"] = "x11"
 
@@ -22,6 +23,8 @@ import cairo
 import mpv
 import requests
 import sys
+from media_stream import MediaStreamServer, discover_local_ip
+from watch_party import WatchPartyClient
 
 WHISPER_API_BASE = os.getenv("WHISPER_API_BASE", "http://192.168.62.1:8000")
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-large-v3")
@@ -42,6 +45,20 @@ class VideoPlayer(Gtk.Application):
         self.embedded_subtitles = []
         self.detected_subtitles = []
         self._click_timeout_id = None # 用于解决单双击冲突
+        self.watch_party = None
+        self.room_code = ""
+        self.room_is_host = False
+        self.room_user_id = ""
+        self.room_sync_guard = False
+        self.room_last_media_warning = ""
+        self.room_server_url = ""
+        self.media_stream_server = None
+        self.current_stream_url = ""
+        self.remote_stream_url = ""
+        self.danmaku_enabled = True
+        self.danmaku_opacity = 80
+        self.danmaku_font_size = 32
+        self.danmaku_duration = 5
         
         # UI 组件引用
         self.window = None
@@ -65,9 +82,18 @@ class VideoPlayer(Gtk.Application):
         self.ai_subtitle_dialog = None
         self.ai_subtitle_spinner = None
         self.ai_subtitle_status_label = None
+        self.room_button = None
+        self.chat_box = None
+        self.chat_view = None
+        self.chat_buffer = None
+        self.chat_entry = None
+        self.chat_send_button = None
+        self.chat_status_label = None
+        self.chat_users_label = None
 
         self.history_file = self.get_history_file()
         self.play_history = self.load_play_history()
+        GLib.timeout_add_seconds(2, self.broadcast_periodic_playback)
 
     def do_activate(self):
         if not self.window:
@@ -293,6 +319,15 @@ class VideoPlayer(Gtk.Application):
                 background-color: #e8f0ff;
                 color: #1d4ed8;
             }
+            #chat-box {
+                background-color: #ffffff;
+                border-left: 1px solid #dcdfe5;
+                padding: 10px;
+            }
+            #chat-status {
+                font-weight: bold;
+                color: #1d4ed8;
+            }
         """
         try:
             provider.load_from_data(css.encode())
@@ -322,6 +357,10 @@ class VideoPlayer(Gtk.Application):
         self.playlist_button.set_name("playlist-btn")
         self.playlist_button.set_tooltip_text("显示/隐藏播放列表")
         self.header_bar.pack_start(self.playlist_button)
+
+        self.room_button = Gtk.Button.new_with_label("影院房间")
+        self.room_button.set_tooltip_text("创建或加入同步观影聊天室")
+        self.header_bar.pack_end(self.room_button)
 
         self.window.set_titlebar(self.header_bar)
 
@@ -362,6 +401,48 @@ class VideoPlayer(Gtk.Application):
         self.playlist_box.pack_start(playlist_scroll, True, True, 0)
         self.playlist_box.hide()
         self.refresh_playlist()
+
+        self.chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.chat_box.set_name("chat-box")
+        self.chat_box.set_size_request(300, -1)
+        content_box.pack_end(self.chat_box, False, False, 0)
+
+        self.chat_status_label = Gtk.Label(label="未连接影院房间")
+        self.chat_status_label.set_name("chat-status")
+        self.chat_status_label.set_xalign(0)
+        self.chat_box.pack_start(self.chat_status_label, False, False, 0)
+
+        self.chat_users_label = Gtk.Label(label="在线用户：0")
+        self.chat_users_label.set_xalign(0)
+        self.chat_box.pack_start(self.chat_users_label, False, False, 0)
+
+        chat_scroll = Gtk.ScrolledWindow()
+        chat_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        self.chat_view = Gtk.TextView()
+        self.chat_view.set_editable(False)
+        self.chat_view.set_cursor_visible(False)
+        self.chat_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.chat_buffer = self.chat_view.get_buffer()
+        chat_scroll.add(self.chat_view)
+        self.chat_box.pack_start(chat_scroll, True, True, 0)
+
+        chat_input_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.chat_entry = Gtk.Entry()
+        self.chat_entry.set_placeholder_text("输入消息...")
+        self.chat_send_button = Gtk.Button.new_with_label("发送")
+        chat_input_row.pack_start(self.chat_entry, True, True, 0)
+        chat_input_row.pack_start(self.chat_send_button, False, False, 0)
+        self.chat_box.pack_start(chat_input_row, False, False, 0)
+
+        chat_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        settings_button = Gtk.Button.new_with_label("弹幕设置")
+        leave_button = Gtk.Button.new_with_label("离开房间")
+        settings_button.connect("clicked", self.show_danmaku_settings)
+        leave_button.connect("clicked", self.leave_watch_party)
+        chat_actions.pack_start(settings_button, True, True, 0)
+        chat_actions.pack_start(leave_button, True, True, 0)
+        self.chat_box.pack_start(chat_actions, False, False, 0)
+        self.chat_box.hide()
 
         # Controls Overlays
         controls_overlay = Gtk.Overlay()
@@ -471,6 +552,9 @@ class VideoPlayer(Gtk.Application):
 
         self.open_btn.connect("clicked", self.on_open_file)
         self.playlist_button.connect("clicked", self.toggle_playlist)
+        self.room_button.connect("clicked", self.show_watch_party_dialog)
+        self.chat_send_button.connect("clicked", self.send_chat_message)
+        self.chat_entry.connect("activate", self.send_chat_message)
         self.playlist_view.connect("row-activated", self.on_playlist_row_activated)
         self.play_button.connect("clicked", self.toggle_play_pause)
         self.volume_label.connect("clicked", self.toggle_mute)
@@ -1012,7 +1096,306 @@ class VideoPlayer(Gtk.Application):
         except Exception as e:
             self.show_error_dialog(f"无法关闭字幕\n\n{str(e)}")
 
+    def show_watch_party_dialog(self, button=None):
+        if self.watch_party:
+            self.chat_box.show_all()
+            return
+
+        dialog = Gtk.Dialog(title="影院房间", parent=self.window, modal=True)
+        dialog.add_buttons(
+            "取消", Gtk.ResponseType.CANCEL,
+            "加入房间", Gtk.ResponseType.APPLY,
+            "创建房间", Gtk.ResponseType.OK,
+        )
+        dialog.set_default_size(420, 220)
+        content = dialog.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_left(16)
+        content.set_margin_right(16)
+
+        name_entry = Gtk.Entry()
+        name_entry.set_placeholder_text("昵称")
+        name_entry.set_text(os.getenv("USER", "Viewer"))
+        server_entry = Gtk.Entry()
+        server_entry.set_placeholder_text("WebSocket 服务地址")
+        server_entry.set_text(os.getenv("WATCH_PARTY_SERVER", "ws://127.0.0.1:8765"))
+        code_entry = Gtk.Entry()
+        code_entry.set_placeholder_text("加入时填写 6 位邀请码")
+        code_entry.set_max_length(6)
+
+        for label_text, entry in [
+            ("昵称", name_entry),
+            ("服务器", server_entry),
+            ("邀请码", code_entry),
+        ]:
+            label = Gtk.Label(label=label_text)
+            label.set_xalign(0)
+            content.pack_start(label, False, False, 0)
+            content.pack_start(entry, False, False, 0)
+
+        dialog.show_all()
+        response = dialog.run()
+        name = name_entry.get_text().strip()
+        server_url = server_entry.get_text().strip()
+        code = code_entry.get_text().strip().upper()
+        dialog.destroy()
+
+        if response == Gtk.ResponseType.CANCEL:
+            return
+        if not name or not server_url:
+            self.show_error_dialog("昵称和服务器地址不能为空。")
+            return
+        if response == Gtk.ResponseType.APPLY and len(code) != 6:
+            self.show_error_dialog("请输入 6 位邀请码。")
+            return
+        self.connect_watch_party(
+            server_url, name, "join" if response == Gtk.ResponseType.APPLY else "create", code
+        )
+
+    def connect_watch_party(self, server_url, name, action, code=""):
+        self.leave_watch_party()
+        if server_url.startswith("http://"):
+            server_url = "ws://" + server_url[len("http://"):]
+        elif server_url.startswith("https://"):
+            server_url = "wss://" + server_url[len("https://"):]
+        self.room_server_url = server_url
+        self.chat_buffer.set_text("")
+        self.chat_status_label.set_text("正在连接...")
+        self.chat_users_label.set_text("在线用户：0")
+        self.chat_box.show_all()
+        self.watch_party = WatchPartyClient(
+            server_url,
+            name,
+            lambda payload: GLib.idle_add(self.handle_watch_party_message, payload),
+            lambda reason: GLib.idle_add(self.handle_watch_party_closed, reason),
+        )
+        self.watch_party.connect(action, code)
+
+    def handle_watch_party_message(self, payload):
+        message_type = payload.get("type")
+        if message_type == "joined":
+            self.room_code = payload.get("room", "")
+            self.room_user_id = payload.get("user_id", "")
+            self.room_is_host = bool(payload.get("is_host"))
+            role = "房主" if self.room_is_host else "成员"
+            self.chat_status_label.set_text(f"房间 {self.room_code} · {role}")
+            self.room_button.set_label(f"房间 {self.room_code}")
+            self.append_chat_line(f"[系统] 已进入房间，邀请码：{self.room_code}")
+            if self.room_is_host:
+                self.ensure_host_media_stream()
+                self.broadcast_playback_state()
+            else:
+                self.apply_remote_playback(payload.get("playback", {}))
+        elif message_type == "participants":
+            users = payload.get("users", [])
+            names = [user.get("name", "") + ("（房主）" if user.get("is_host") else "") for user in users]
+            self.chat_users_label.set_text(f"在线用户：{len(users)}  " + "、".join(names))
+        elif message_type == "chat":
+            name = payload.get("name", "Anonymous")
+            text = payload.get("text", "")
+            self.append_chat_line(f"{name}：{text}")
+            if self.danmaku_enabled:
+                self.show_danmaku(name, text)
+        elif message_type == "system":
+            self.append_chat_line(f"[系统] {payload.get('message', '')}")
+        elif message_type == "playback" and not self.room_is_host:
+            self.apply_remote_playback(payload)
+        elif message_type in ("error", "room_closed"):
+            self.show_error_dialog(payload.get("message", "房间连接已关闭。"))
+            self.leave_watch_party()
+        return False
+
+    def handle_watch_party_closed(self, reason):
+        if self.watch_party:
+            self.append_chat_line(f"[系统] 连接断开：{reason}")
+            self.leave_watch_party()
+        return False
+
+    def leave_watch_party(self, button=None):
+        if self.watch_party:
+            self.watch_party.close()
+        self.watch_party = None
+        self.room_code = ""
+        self.room_user_id = ""
+        self.room_is_host = False
+        self.room_sync_guard = False
+        self.room_server_url = ""
+        self.remote_stream_url = ""
+        if self.media_stream_server:
+            self.media_stream_server.close()
+            self.media_stream_server = None
+        if self.chat_box:
+            self.chat_box.hide()
+        if self.room_button:
+            self.room_button.set_label("影院房间")
+
+    def append_chat_line(self, text):
+        if not self.chat_buffer:
+            return
+        end_iter = self.chat_buffer.get_end_iter()
+        prefix = "" if end_iter.get_offset() == 0 else "\n"
+        self.chat_buffer.insert(end_iter, prefix + str(text))
+        mark = self.chat_buffer.create_mark(None, self.chat_buffer.get_end_iter(), False)
+        self.chat_view.scroll_mark_onscreen(mark)
+        self.chat_buffer.delete_mark(mark)
+
+    def send_chat_message(self, widget=None):
+        text = self.chat_entry.get_text().strip()
+        if not text:
+            return
+        if not self.watch_party or not self.watch_party.send({"type": "chat", "text": text}):
+            self.show_error_dialog("消息发送失败，请检查房间连接。")
+            return
+        self.chat_entry.set_text("")
+
+    def show_danmaku(self, name, text):
+        if not self.mpv_player or not self.current_file:
+            return
+        safe_text = f"{name}：{text}".replace("\n", " ").replace("${", "$ {")
+        try:
+            self.mpv_player.osd_font_size = self.danmaku_font_size
+            self.mpv_player.osd_color = (
+                f"1.0/1.0/1.0/{self.danmaku_opacity / 100:.2f}"
+            )
+            self.mpv_player.osd_align_x = "center"
+            self.mpv_player.osd_align_y = "top"
+            self.mpv_player.command("show-text", safe_text, self.danmaku_duration * 1000)
+        except Exception as e:
+            print(f"Danmaku display failed: {e}")
+
+    def show_danmaku_settings(self, button=None):
+        dialog = Gtk.Dialog(title="弹幕设置", parent=self.window, modal=True)
+        dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
+        content = dialog.get_content_area()
+        content.set_spacing(12)
+        content.set_margin_top(16)
+        content.set_margin_bottom(16)
+        content.set_margin_left(16)
+        content.set_margin_right(16)
+
+        enabled = Gtk.Switch()
+        enabled.set_active(self.danmaku_enabled)
+        opacity = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 100, 5)
+        opacity.set_value(self.danmaku_opacity)
+        opacity.set_value_pos(Gtk.PositionType.RIGHT)
+        font_size = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 16, 72, 2)
+        font_size.set_value(self.danmaku_font_size)
+        font_size.set_value_pos(Gtk.PositionType.RIGHT)
+        duration = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 2, 12, 1)
+        duration.set_value(self.danmaku_duration)
+        duration.set_value_pos(Gtk.PositionType.RIGHT)
+
+        grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        for row, (label_text, control) in enumerate([
+            ("启用弹幕", enabled),
+            ("透明度（%）", opacity),
+            ("字号", font_size),
+            ("显示时长（秒）", duration),
+        ]):
+            label = Gtk.Label(label=label_text)
+            label.set_xalign(0)
+            grid.attach(label, 0, row, 1, 1)
+            grid.attach(control, 1, row, 1, 1)
+        content.pack_start(grid, True, True, 0)
+        dialog.show_all()
+        if dialog.run() == Gtk.ResponseType.OK:
+            self.danmaku_enabled = enabled.get_active()
+            self.danmaku_opacity = int(opacity.get_value())
+            self.danmaku_font_size = int(font_size.get_value())
+            self.danmaku_duration = int(duration.get_value())
+        dialog.destroy()
+
+    def current_media_identity(self):
+        if not self.current_file or self.remote_stream_url:
+            return "", 0
+        try:
+            return os.path.basename(self.current_file), os.path.getsize(self.current_file)
+        except OSError:
+            return os.path.basename(self.current_file), 0
+
+    def ensure_host_media_stream(self):
+        if not self.room_is_host or not self.current_file or self.remote_stream_url:
+            return ""
+        if not os.path.isfile(self.current_file):
+            return ""
+        if not self.media_stream_server:
+            advertised_host = discover_local_ip(self.room_server_url)
+            self.media_stream_server = MediaStreamServer(advertised_host)
+        self.current_stream_url = self.media_stream_server.set_file(self.current_file)
+        return self.current_stream_url
+
+    def broadcast_playback_state(self):
+        if not self.watch_party or not self.room_is_host or self.room_sync_guard:
+            return
+        media_name, media_size = self.current_media_identity()
+        stream_url = self.ensure_host_media_stream()
+        self.watch_party.send({
+            "type": "playback",
+            "playing": self.is_playing,
+            "position": self.get_current_time(),
+            "speed": float(getattr(self.mpv_player, "speed", 1.0) or 1.0),
+            "media_name": media_name,
+            "media_size": media_size,
+            "stream_url": stream_url,
+        })
+
+    def broadcast_periodic_playback(self):
+        self.broadcast_playback_state()
+        return True
+
+    def apply_remote_playback(self, state):
+        media_name = state.get("media_name", "")
+        stream_url = str(state.get("stream_url", "")).strip()
+        if not media_name or not stream_url:
+            return
+
+        if self.remote_stream_url != stream_url:
+            self.load_remote_stream(stream_url, media_name)
+            GLib.timeout_add(700, self.finish_remote_playback_sync, dict(state))
+            return
+
+        self.finish_remote_playback_sync(state)
+
+    def load_remote_stream(self, stream_url, media_name):
+        if not self.mpv_player:
+            return
+        self.remote_stream_url = stream_url
+        self.current_file = stream_url
+        self.room_sync_guard = True
+        try:
+            self.mpv_player.play(stream_url)
+            self.is_playing = True
+            self.header_bar.set_subtitle(f"{media_name}（房主视频流）")
+            self.update_play_button()
+            self.drawing_area.queue_draw()
+            self.append_chat_line(f"[系统] 已自动加载房主视频：{media_name}")
+        finally:
+            self.room_sync_guard = False
+
+    def finish_remote_playback_sync(self, state):
+        if self.room_is_host or not self.remote_stream_url:
+            return False
+        self.room_sync_guard = True
+        try:
+            target = max(0.0, float(state.get("position", 0.0)))
+            if state.get("playing"):
+                target += max(0.0, time.time() - float(state.get("updated_at", time.time())))
+            if abs(self.get_current_time() - target) > 1.2:
+                self.mpv_player.seek(target, "absolute+exact")
+            self.is_playing = bool(state.get("playing"))
+            self.mpv_player.speed = float(state.get("speed", 1.0) or 1.0)
+            self.mpv_player.pause = not self.is_playing
+            self.update_play_button()
+        finally:
+            self.room_sync_guard = False
+        return False
+
     def on_open_file(self, button):
+        if self.watch_party and not self.room_is_host:
+            self.show_info_dialog("房间成员会自动播放房主的视频流，无需打开本地文件。")
+            return
         dialog = Gtk.FileChooserDialog(
             title="选择视频文件",
             parent=self.window,
@@ -1037,6 +1420,7 @@ class VideoPlayer(Gtk.Application):
         if not self.mpv_player:
             return
         try:
+            self.remote_stream_url = ""
             self.current_file = file_path
             self.mpv_player.play(file_path)
             self.is_playing = True
@@ -1051,6 +1435,8 @@ class VideoPlayer(Gtk.Application):
             
             self.header_bar.set_subtitle(os.path.basename(file_path))
             self.drawing_area.queue_draw() # 触发重绘清除提示文字
+            self.ensure_host_media_stream()
+            self.broadcast_playback_state()
             
         except Exception as e:
             self.show_error_dialog(f"无法加载视频文件\n\n{str(e)}")
@@ -1058,10 +1444,13 @@ class VideoPlayer(Gtk.Application):
     def toggle_play_pause(self, button):
         if not self.current_file or not self.mpv_player:
             return
+        if self.watch_party and not self.room_is_host:
+            return
             
         self.is_playing = not self.is_playing
         self.mpv_player.pause = not self.is_playing
         self.update_play_button()
+        self.broadcast_playback_state()
 
     def update_play_button(self):
         icon_name = "media-playback-pause-symbolic" if self.is_playing else "media-playback-start-symbolic"
@@ -1088,11 +1477,14 @@ class VideoPlayer(Gtk.Application):
             self.header_bar.show()
             if self.is_playlist_visible:
                 self.playlist_box.show_all()
+            if self.watch_party:
+                self.chat_box.show_all()
         else:
             self.window.fullscreen()
             self.controls_box.hide()
             self.header_bar.hide()
             self.playlist_box.hide()
+            self.chat_box.hide()
             
         self.is_fullscreen = not self.is_fullscreen
         self.drawing_area.grab_focus() # 全屏后重新获取焦点，保证键盘生效
@@ -1109,6 +1501,8 @@ class VideoPlayer(Gtk.Application):
 
     def on_progress_release(self, scale, event):
         self.is_seeking = False
+        if self.watch_party and not self.room_is_host:
+            return
         self.seek_to_position(scale.get_value())
 
     def on_progress_changed(self, scale):
@@ -1121,6 +1515,7 @@ class VideoPlayer(Gtk.Application):
         if self.mpv_player and self.current_file:
             target = (percentage / 100) * self.get_duration()
             self.mpv_player.seek(target, 'absolute+exact')
+            self.broadcast_playback_state()
 
     def update_progress(self, time_pos):
         duration = self.get_duration()
@@ -1142,6 +1537,7 @@ class VideoPlayer(Gtk.Application):
         if not self.is_looping:
             self.is_playing = False
             self.update_play_button()
+            self.broadcast_playback_state()
 
     # --- 辅助方法 ---
     def get_duration(self):
@@ -1188,8 +1584,11 @@ class VideoPlayer(Gtk.Application):
 
     def on_speed_changed(self, combo):
         if self.mpv_player:
+            if self.watch_party and not self.room_is_host:
+                return
             speed_str = combo.get_model()[combo.get_active()][0]
             self.mpv_player.speed = float(speed_str.replace('x', ''))
+            self.broadcast_playback_state()
 
     def apply_current_aspect_ratio(self):
         if not self.mpv_player or not self.aspect_combo:
@@ -1223,10 +1622,14 @@ class VideoPlayer(Gtk.Application):
             self.toggle_fullscreen()
             return True
         elif keyname == 'Left':
-            if self.mpv_player: self.mpv_player.seek(-5, 'relative+exact')
+            if self.mpv_player and (not self.watch_party or self.room_is_host):
+                self.mpv_player.seek(-5, 'relative+exact')
+                self.broadcast_playback_state()
             return True
         elif keyname == 'Right':
-            if self.mpv_player: self.mpv_player.seek(5, 'relative+exact')
+            if self.mpv_player and (not self.watch_party or self.room_is_host):
+                self.mpv_player.seek(5, 'relative+exact')
+                self.broadcast_playback_state()
             return True
         elif keyname == 'Up':
             self.volume_scale.set_value(min(100, self.volume_scale.get_value() + 5))
@@ -1321,6 +1724,7 @@ class VideoPlayer(Gtk.Application):
         self.ai_subtitle_status_label = None
 
     def on_delete_event(self, widget, event):
+        self.leave_watch_party()
         if self.mpv_player:
             try: self.mpv_player.terminate()
             except: pass
