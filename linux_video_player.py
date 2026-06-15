@@ -55,10 +55,15 @@ class VideoPlayer(Gtk.Application):
         self.media_stream_server = None
         self.current_stream_url = ""
         self.remote_stream_url = ""
+        self.is_chat_visible = False
         self.danmaku_enabled = True
         self.danmaku_opacity = 80
         self.danmaku_font_size = 32
         self.danmaku_duration = 5
+        self.danmaku_items = []
+        self.danmaku_tracks = {}  # 轨道索引 -> 占用结束时间（单调时钟）
+        self._danmaku_timer_id = None
+        self._danmaku_overlay_supported = None
         
         # UI 组件引用
         self.window = None
@@ -83,6 +88,7 @@ class VideoPlayer(Gtk.Application):
         self.ai_subtitle_spinner = None
         self.ai_subtitle_status_label = None
         self.room_button = None
+        self.chat_toggle_button = None
         self.chat_box = None
         self.chat_view = None
         self.chat_buffer = None
@@ -362,6 +368,12 @@ class VideoPlayer(Gtk.Application):
         self.room_button.set_tooltip_text("创建或加入同步观影聊天室")
         self.header_bar.pack_end(self.room_button)
 
+        self.chat_toggle_button = Gtk.Button.new_with_label("隐藏聊天室")
+        self.chat_toggle_button.set_tooltip_text("显示或隐藏聊天室")
+        self.chat_toggle_button.set_no_show_all(True)
+        self.chat_toggle_button.hide()
+        self.header_bar.pack_end(self.chat_toggle_button)
+
         self.window.set_titlebar(self.header_bar)
 
         content_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
@@ -405,6 +417,7 @@ class VideoPlayer(Gtk.Application):
         self.chat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         self.chat_box.set_name("chat-box")
         self.chat_box.set_size_request(300, -1)
+        self.chat_box.set_no_show_all(True)
         content_box.pack_end(self.chat_box, False, False, 0)
 
         self.chat_status_label = Gtk.Label(label="未连接影院房间")
@@ -543,7 +556,7 @@ class VideoPlayer(Gtk.Application):
     def connect_signals(self):
         self.window.connect("delete-event", self.on_delete_event)
         self.window.connect("key-press-event", self.on_key_press)
-        
+
         self.drawing_area.connect("realize", self.on_drawing_area_realize)
         self.drawing_area.connect("draw", self.on_draw)
         self.drawing_area.connect("button-press-event", self.on_video_click)
@@ -553,6 +566,7 @@ class VideoPlayer(Gtk.Application):
         self.open_btn.connect("clicked", self.on_open_file)
         self.playlist_button.connect("clicked", self.toggle_playlist)
         self.room_button.connect("clicked", self.show_watch_party_dialog)
+        self.chat_toggle_button.connect("clicked", self.toggle_chat_panel)
         self.chat_send_button.connect("clicked", self.send_chat_message)
         self.chat_entry.connect("activate", self.send_chat_message)
         self.playlist_view.connect("row-activated", self.on_playlist_row_activated)
@@ -619,8 +633,8 @@ class VideoPlayer(Gtk.Application):
     def on_draw(self, widget, cr):
         # 【优化】如果视频正在播放，不要用黑色覆盖，让 MPV 渲染
         if self.current_file:
-            return True 
-            
+            return True
+
         width = widget.get_allocated_width()
         height = widget.get_allocated_height()
         cr.set_source_rgb(0.07, 0.07, 0.09)
@@ -1098,7 +1112,8 @@ class VideoPlayer(Gtk.Application):
 
     def show_watch_party_dialog(self, button=None):
         if self.watch_party:
-            self.chat_box.show_all()
+            if self.room_code:
+                self.set_chat_panel_visible(True)
             return
 
         dialog = Gtk.Dialog(title="影院房间", parent=self.window, modal=True)
@@ -1164,7 +1179,6 @@ class VideoPlayer(Gtk.Application):
         self.chat_buffer.set_text("")
         self.chat_status_label.set_text("正在连接...")
         self.chat_users_label.set_text("在线用户：0")
-        self.chat_box.show_all()
         self.watch_party = WatchPartyClient(
             server_url,
             name,
@@ -1182,6 +1196,9 @@ class VideoPlayer(Gtk.Application):
             role = "房主" if self.room_is_host else "成员"
             self.chat_status_label.set_text(f"房间 {self.room_code} · {role}")
             self.room_button.set_label(f"房间 {self.room_code}")
+            self.chat_toggle_button.set_no_show_all(False)
+            self.chat_toggle_button.show()
+            self.set_chat_panel_visible(True)
             self.append_chat_line(f"[系统] 已进入房间，邀请码：{self.room_code}")
             if self.room_is_host:
                 self.ensure_host_media_stream()
@@ -1226,10 +1243,33 @@ class VideoPlayer(Gtk.Application):
         if self.media_stream_server:
             self.media_stream_server.close()
             self.media_stream_server = None
+        self.set_chat_panel_visible(False)
         if self.chat_box:
-            self.chat_box.hide()
+            self.chat_box.set_no_show_all(True)
+        if self.chat_toggle_button:
+            self.chat_toggle_button.hide()
+            self.chat_toggle_button.set_no_show_all(True)
         if self.room_button:
             self.room_button.set_label("影院房间")
+
+    def toggle_chat_panel(self, button=None):
+        if not self.watch_party or not self.room_code:
+            return
+        self.set_chat_panel_visible(not self.is_chat_visible)
+
+    def set_chat_panel_visible(self, visible):
+        visible = bool(visible and self.watch_party and self.room_code)
+        self.is_chat_visible = visible
+        if self.chat_box:
+            self.chat_box.set_no_show_all(not visible)
+            if visible and not self.is_fullscreen:
+                self.chat_box.show_all()
+            else:
+                self.chat_box.hide()
+        if self.chat_toggle_button:
+            self.chat_toggle_button.set_label(
+                "隐藏聊天室" if visible else "显示聊天室"
+            )
 
     def append_chat_line(self, text):
         if not self.chat_buffer:
@@ -1251,22 +1291,141 @@ class VideoPlayer(Gtk.Application):
         self.chat_entry.set_text("")
 
     def show_danmaku(self, name, text):
-        if not self.mpv_player or not self.current_file:
+        """通过 mpv OSD 绘制从右向左滚动的弹幕。"""
+        if not self.current_file or not self.mpv_player:
             return
-        safe_text = f"{name}：{text}".replace("\n", " ").replace("${", "$ {")
-        try:
-            self.mpv_player.osd_font_size = self.danmaku_font_size
-            self.mpv_player.osd_color = (
-                f"1.0/1.0/1.0/{self.danmaku_opacity / 100:.2f}"
+        now = time.monotonic()
+        track = self._allocate_track(now)
+        self.danmaku_items.append({
+            "text": self._escape_osd_ass_text(f"{name}：{text}"),
+            "start": now,
+            "duration": max(1.0, float(self.danmaku_duration)),
+            "track": track,
+            "font_size": self.danmaku_font_size,
+            "opacity": self.danmaku_opacity,
+        })
+        self._render_danmaku_osd(now)
+        if self._danmaku_timer_id is None:
+            self._danmaku_timer_id = GLib.timeout_add(
+                16, self._refresh_danmaku_frame
             )
-            self.mpv_player.osd_align_x = "center"
-            self.mpv_player.osd_align_y = "top"
-            self.mpv_player.command("show-text", safe_text, self.danmaku_duration * 1000)
+
+    def _render_danmaku_osd(self, now):
+        """生成当前帧的 ASS OSD，并交给 mpv 合成到视频画面。"""
+        if not self.mpv_player:
+            return
+        active_items = []
+        ass_fragments = []
+        plain_texts = []
+
+        for item in self.danmaku_items:
+            progress = (now - item["start"]) / item["duration"]
+            if progress < 0 or progress >= 1:
+                continue
+
+            font_size = item["font_size"]
+            text_width = max(font_size * 4, len(item["text"]) * font_size)
+            x_pos = 1920 - progress * (1920 + text_width + 40)
+            y_pos = 30 + item["track"] * (font_size + 10)
+            alpha = format(
+                round((1 - item["opacity"] / 100.0) * 255), "02X"
+            )
+            fragment = (
+                f"{{\\an7\\pos({int(x_pos)},{int(y_pos)})"
+                f"\\fs{font_size}\\bord2\\1c&HFFFFFF&\\1a&H{alpha}&"
+                f"\\3c&H000000&\\3a&H80&}}{item['text']}"
+            )
+            ass_fragments.append(fragment)
+            plain_texts.append(item["text"])
+            active_items.append(item)
+
+        self.danmaku_items = active_items
+        # osd-overlay 的 ass-events 格式只接收 ASS Text 字段内容，
+        # 不能包含完整的 Dialogue: 事件行。
+        data = "\n".join(ass_fragments)
+        if self._danmaku_overlay_supported is not False:
+            try:
+                self.mpv_player.command(
+                    "osd-overlay",
+                    42,
+                    "ass-events" if data else "none",
+                    data,
+                    1920,
+                    1080,
+                    100,
+                )
+                self._danmaku_overlay_supported = True
+                return
+            except Exception as e:
+                if self._danmaku_overlay_supported is None:
+                    print(f"DANMAKU osd-overlay unavailable, using fallback: {e}")
+                self._danmaku_overlay_supported = False
+
+        # 极旧版 mpv 不支持 osd-overlay 时仅显示纯文本，避免把 ASS
+        # 控制标签直接显示给用户。
+        fallback = plain_texts[0] if plain_texts else ""
+        try:
+            self.mpv_player.command("show-text", fallback, 50)
         except Exception as e:
-            print(f"Danmaku display failed: {e}")
+            print(f"DANMAKU OSD render error: {e}")
+
+    def _refresh_danmaku_frame(self):
+        if self.mpv_player and self.danmaku_items:
+            self._render_danmaku_osd(time.monotonic())
+            return True
+        self._danmaku_timer_id = None
+        return False
+
+    def _allocate_track(self, current_time):
+        """分配一个弹幕轨道索引"""
+        max_tracks = max(
+            1, min(12, (1080 - 40) // (self.danmaku_font_size + 10))
+        )
+        self.danmaku_tracks = {
+            track: release_time
+            for track, release_time in self.danmaku_tracks.items()
+            if release_time > current_time
+        }
+        for i in range(max_tracks):
+            if i not in self.danmaku_tracks:
+                self.danmaku_tracks[i] = current_time + self.danmaku_duration
+                return i
+        track = min(self.danmaku_tracks, key=self.danmaku_tracks.get)
+        self.danmaku_tracks[track] = current_time + self.danmaku_duration
+        return track
+
+    def _cleanup_danmaku(self):
+        """清理当前显示中的 mpv OSD 弹幕。"""
+        self.danmaku_items = []
+        self.danmaku_tracks = {}
+        if self._danmaku_timer_id is not None:
+            GLib.source_remove(self._danmaku_timer_id)
+            self._danmaku_timer_id = None
+        if self.mpv_player:
+            try:
+                if self._danmaku_overlay_supported:
+                    self.mpv_player.command(
+                        "osd-overlay", 42, "none"
+                    )
+                else:
+                    self.mpv_player.command("show-text", "", 0)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _escape_osd_ass_text(text):
+        return (
+            str(text)
+            .replace("\\", r"\\")
+            .replace("{", r"\{")
+            .replace("}", r"\}")
+            .replace("\r", " ")
+            .replace("\n", " ")
+        )
 
     def show_danmaku_settings(self, button=None):
         dialog = Gtk.Dialog(title="弹幕设置", parent=self.window, modal=True)
+        dialog.set_default_size(460, -1)
         dialog.add_buttons("取消", Gtk.ResponseType.CANCEL, "保存", Gtk.ResponseType.OK)
         content = dialog.get_content_area()
         content.set_spacing(12)
@@ -1278,16 +1437,24 @@ class VideoPlayer(Gtk.Application):
         enabled = Gtk.Switch()
         enabled.set_active(self.danmaku_enabled)
         opacity = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 10, 100, 5)
+        opacity.set_size_request(280, -1)
+        opacity.set_hexpand(True)
         opacity.set_value(self.danmaku_opacity)
         opacity.set_value_pos(Gtk.PositionType.RIGHT)
         font_size = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 16, 72, 2)
+        font_size.set_size_request(280, -1)
+        font_size.set_hexpand(True)
         font_size.set_value(self.danmaku_font_size)
         font_size.set_value_pos(Gtk.PositionType.RIGHT)
         duration = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 2, 12, 1)
+        duration.set_size_request(280, -1)
+        duration.set_hexpand(True)
         duration.set_value(self.danmaku_duration)
         duration.set_value_pos(Gtk.PositionType.RIGHT)
 
         grid = Gtk.Grid(column_spacing=12, row_spacing=12)
+        grid.set_column_homogeneous(False)
+        grid.set_hexpand(True)
         for row, (label_text, control) in enumerate([
             ("启用弹幕", enabled),
             ("透明度（%）", opacity),
@@ -1298,13 +1465,26 @@ class VideoPlayer(Gtk.Application):
             label.set_xalign(0)
             grid.attach(label, 0, row, 1, 1)
             grid.attach(control, 1, row, 1, 1)
+        grid.get_child_at(1, 0).set_halign(Gtk.Align.START)
         content.pack_start(grid, True, True, 0)
         dialog.show_all()
         if dialog.run() == Gtk.ResponseType.OK:
+            previous_settings = (
+                self.danmaku_opacity,
+                self.danmaku_font_size,
+                self.danmaku_duration,
+            )
             self.danmaku_enabled = enabled.get_active()
             self.danmaku_opacity = int(opacity.get_value())
             self.danmaku_font_size = int(font_size.get_value())
             self.danmaku_duration = int(duration.get_value())
+            current_settings = (
+                self.danmaku_opacity,
+                self.danmaku_font_size,
+                self.danmaku_duration,
+            )
+            if current_settings != previous_settings:
+                self._cleanup_danmaku()
         dialog.destroy()
 
     def current_media_identity(self):
@@ -1422,6 +1602,7 @@ class VideoPlayer(Gtk.Application):
         try:
             self.remote_stream_url = ""
             self.current_file = file_path
+            self._cleanup_danmaku()
             self.mpv_player.play(file_path)
             self.is_playing = True
             self.update_play_button()
@@ -1477,7 +1658,8 @@ class VideoPlayer(Gtk.Application):
             self.header_bar.show()
             if self.is_playlist_visible:
                 self.playlist_box.show_all()
-            if self.watch_party:
+            if self.watch_party and self.room_code and self.is_chat_visible:
+                self.chat_box.set_no_show_all(False)
                 self.chat_box.show_all()
         else:
             self.window.fullscreen()
@@ -1725,6 +1907,7 @@ class VideoPlayer(Gtk.Application):
 
     def on_delete_event(self, widget, event):
         self.leave_watch_party()
+        self._cleanup_danmaku()
         if self.mpv_player:
             try: self.mpv_player.terminate()
             except: pass
